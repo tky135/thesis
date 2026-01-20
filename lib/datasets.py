@@ -14,7 +14,7 @@ import torch.nn.utils.rnn
 from tokenizers import Tokenizer
 
 # Generate using misc/owt2_preprocess.py
-OPENWEBTEXT2_DATA_DIR = '/REPLACE_ME'
+OPENWEBTEXT2_DATA_DIR = '/data02/kt19/owt2'
 # https://mattmahoney.net/dc/enwik8.zip
 ENWIK8_PATH           = '/REPLACE_ME/data/enwik8'
 # https://mattmahoney.net/dc/text8.zip
@@ -87,14 +87,26 @@ def _tokenize(iterator, tokenizer):
         i = i % batch_size
         batch[i] = x
         if i == (batch_size - 1):
-            tokenized = tokenizer.encode_batch(batch)
-            for x in tokenized:
-                yield torch.tensor(x.ids)
+            if hasattr(tokenizer, "encode_batch"):
+                tokenized = tokenizer.encode_batch(batch)
+                for x in tokenized:
+                    yield torch.tensor(x.ids)
+            else:
+                out = tokenizer(
+                    batch,
+                    add_special_tokens=False,   # IMPORTANT: we add separators ourselves
+                    padding=False,
+                    truncation=False,
+                    return_attention_mask=False,
+                    return_token_type_ids=False,
+                )
+                for ids in out["input_ids"]:
+                    yield torch.tensor(ids, dtype=torch.int64)
 
 
 def _to_chunks(iterator, chunk_size):
     buffer = torch.tensor([], dtype=torch.int64)
-    eot_token = torch.tensor([0], dtype=torch.int64)
+    eot_token = torch.tensor([2], dtype=torch.int64)
     for x in iterator:
         buffer = torch.cat([buffer, x, eot_token], dim=0)
         while buffer.shape[0] >= chunk_size:
@@ -116,12 +128,14 @@ class _OWT2IterableDataset(torch.utils.data.IterableDataset):
         self.world_size = lib.ddp.world_size()
     def __iter__(self):
         train, batch_size, seq_len, tokenizer = self.args
+
         if train:
             iterator = openwebtext2_train_iterator(
                 rank=self.rank, world_size=self.world_size
             )
         else:
             iterator = _openwebtext2_val_iterator()
+            
         iterator = _rolling_shuffle(iterator, 10)
         iterator = _tokenize(iterator, tokenizer)
         iterator = _to_chunks(iterator, seq_len)
@@ -139,14 +153,21 @@ def openwebtext2_tokenizer():
     tokenizer = Tokenizer.from_file(tokenizer_path)
     return tokenizer
 
+
+def deberta_tokenizer():
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("microsoft/deberta-v3-large", use_fast=True)
+    return tokenizer
+
+
 def openwebtext2(batch_size, val_batch_size, seq_len):
     if seq_len is None:
         seq_len = 1024
 
-    tokenizer = openwebtext2_tokenizer()
+    tokenizer = deberta_tokenizer()
     word2idx = {k.encode('utf-8'):v for k,v in tokenizer.get_vocab().items()}
     idx2word = {v:k for k,v in word2idx.items()}
-
+    
     train_iterator = iter(torch.utils.data.DataLoader(
         _OWT2IterableDataset(True, batch_size, seq_len, tokenizer),
         batch_size=None, num_workers=1, prefetch_factor=1024//batch_size))

@@ -20,24 +20,79 @@ import torch.nn.functional as F
 import tqdm
 from torch import nn, optim, autograd
 from torch.nn.parallel import DistributedDataParallel as DDP
+from ipdb import iex
+
+from transformers import AutoTokenizer, AutoModel
+
+class DebertaTeacher(nn.Module):
+    def __init__(self, name="microsoft/deberta-v3-large", device="cuda",
+                 use_layer="second_last", max_length=256, dtype=torch.float16, pool=False):
+        super().__init__()
+        self.tokenizer = AutoTokenizer.from_pretrained(name, use_fast=True)
+        self.model = AutoModel.from_pretrained(name)
+        self.model.eval()
+        self.model.requires_grad_(False)
+        self.device = device
+        self.max_length = max_length
+        self.use_layer = use_layer
+        self.dtype = dtype
+        self.model.to(self.device)
+        self.pool = pool
+    
+    @torch.no_grad()
+    def forward(self, input_ids):
+        # enc = self.tokenizer(
+        #     texts,
+        #     padding=True,
+        #     truncation=True,
+        #     max_length=self.max_length,
+        #     return_tensors="pt",
+        # ).to(self.device)
+
+        # import ipdb ; ipdb.set_trace()
+        
+        # input_ids
+        token_type_ids = torch.zeros_like(input_ids)
+        attention_mask = torch.ones_like(input_ids)
+        # Use autocast to reduce teacher overhead on GPU
+        with torch.autocast(device_type="cuda", dtype=self.dtype):
+            out = self.model(input_ids=input_ids, token_type_ids=token_type_ids, attention_mask=attention_mask, output_hidden_states=True, return_dict=True)
+
+        if self.use_layer == "last":
+            h = out.last_hidden_state                 # [B, Lt, H]
+        elif self.use_layer == "second_last":
+            h = out.hidden_states[-2]
+        else:
+            raise ValueError("use_layer must be 'last' or 'second_last'")
+
+        if self.pool is True:
+            attn = enc["attention_mask"].unsqueeze(-1)     # [B, Lt, 1]
+            pooled = (h * attn).sum(dim=1) / attn.sum(dim=1).clamp_min(1.0)  # [B, H]
+            return pooled
+        else:
+            return h
+        
+# teacher = DebertaTeacher()
+# teacher("this is a bad cat. This is also a bad dog")
+# import ipdb ; ipdb.set_trace()
 
 def main(**args):
     args = lib.utils.AttributeDict(args)
-    args.setdefault('batch_size', 256)
+    args.setdefault('batch_size', 16)
     args.setdefault('dataset', 'openwebtext2')
     args.setdefault('grad_accum_steps', 1)
-    args.setdefault('hook_freq', 10000)
+    args.setdefault('hook_freq', 100)
     args.setdefault('lr', 1.4e-3)
     args.setdefault('lr_warmup_steps', 2500)
     args.setdefault('bias_warmup_steps', 5000)
     args.setdefault('lr_decay', True)
-    args.setdefault('print_freq', 1000)
+    args.setdefault('print_freq', 100)
     args.setdefault('save_weights', True)
     args.setdefault('steps', 92000)
     args.setdefault('weights_path', None)
     args.setdefault('reconst_weight', 1.0)
     args.setdefault('dim', 384)
-    args.setdefault('n_blocks', 16)
+    args.setdefault('n_blocks', 3)
     args.setdefault('n_heads', 6)
     args.setdefault('gamma_0', -3.)
     args.setdefault('gamma_1', 6.)
@@ -140,21 +195,29 @@ def main(**args):
     diffusion_ema     = torch.tensor(1e-8)
     reconst_sqr_ema   = torch.tensor(1e-8)
     diffusion_sqr_ema = torch.tensor(1e-8)
+    repa_ema          = torch.tensor(1e-8)
     reconst_bs_cache  = {}
+    
+    teacher = DebertaTeacher()
+    
+    @iex
     def forward(step=None, accum_step=None, accum_total=None, x_eval=None):
         """
         Train mode: step, accum_step, accum_total
         Eval mode: x_eval
         """
-        nonlocal reconst_ema, diffusion_ema, reconst_sqr_ema, diffusion_sqr_ema
-
+        nonlocal reconst_ema, diffusion_ema, reconst_sqr_ema, diffusion_sqr_ema, repa_ema
         train_mode = (x_eval is None)
         if train_mode:
             x = next(train_iterator)
+            
+            
+            y_teacher = teacher(x.cuda())
             batch_size = x.shape[0] * accum_total
             if step not in reconst_bs_cache:
                 # Synchronize EMA vars
                 reconst_ema       = lib.ddp.reduce_mean(reconst_ema)
+                repa_ema          = lib.ddp.reduce_mean(repa_ema)
                 reconst_sqr_ema   = lib.ddp.reduce_mean(reconst_sqr_ema)
                 diffusion_ema     = lib.ddp.reduce_mean(diffusion_ema)
                 diffusion_sqr_ema = lib.ddp.reduce_mean(diffusion_sqr_ema)
@@ -178,6 +241,7 @@ def main(**args):
 
         selfcond_mask = torch.zeros([batch_size], device='cuda')
         avg_selfcond_mask = 0.
+        # if False: # args.selfcond
         if args.selfcond:
             if train_mode:
                 offset = int(np.random.randint(4))
@@ -296,10 +360,11 @@ def main(**args):
 
         # Main model forward pass
         with torch.enable_grad():
-            logits, x_reconst = ddp_modules['model'](
+            logits, x_reconst, latents = ddp_modules['model'](
                 z, gamma, embedding_matrix, bias_scale, x_selfcond,
                 selfcond_mask=selfcond_mask,
-                cu_seqlens=cu_seqlens
+                cu_seqlens=cu_seqlens,
+                get_latents=True
             )
 
         # Loss terms
@@ -320,11 +385,29 @@ def main(**args):
         diffusion_loss = (x_embed - x_reconst).pow(2)
         diffusion_loss = diffusion_loss.mean(dim=1).double().sum(dim=1)
         diffusion_loss = -0.5*(snr_prime * diffusion_loss)
+        
+        if train_mode:
+            # Add representation alignment loss
+            
+            y_student = ddp_modules['model'](None, None, None, None, None, repa=True, y_student=latents[1]
+                                            )
+            y_teacher = y_teacher.detach().float()
+            
+            y_student = F.normalize(y_student, dim=-1)
+            y_teacher  = F.normalize(y_teacher,  dim=-1)
+            cos = (y_teacher * y_student).sum(dim=-1)
+            repa_loss = (1.0 - cos).mean()
+        else:
+            repa_loss = torch.tensor(0.0).cuda().float()
+        
+        if step is not None and step % 100 == 0:
+            print("repa_ema: ", repa_ema, "diffusion_ema: ", diffusion_ema, "reconst_ema: ", reconst_ema)
 
         if train_mode:
             with torch.no_grad():
                 loss_ema_bias.lerp_(     torch.tensor(1., device='cuda'),                                                   1 - args.reconst_bs_ema)
                 reconst_ema.lerp_(       (args.reconst_weight * reconst_loss).sum()        / avg_reconst_bs,                1 - args.reconst_bs_ema)
+                repa_ema.lerp_(          repa_loss.double(),                                                                         1 - args.reconst_bs_ema)
                 reconst_sqr_ema.lerp_(   (args.reconst_weight * reconst_loss).pow(2).sum() / avg_reconst_bs,                1 - args.reconst_bs_ema)
                 diffusion_ema.lerp_(     diffusion_loss[reconst_bs:].sum()                 / (batch_size - avg_reconst_bs), 1 - args.reconst_bs_ema)
                 diffusion_sqr_ema.lerp_( diffusion_loss[reconst_bs:].pow(2).sum()          / (batch_size - avg_reconst_bs), 1 - args.reconst_bs_ema)
@@ -334,6 +417,7 @@ def main(**args):
         loss = (args.reconst_weight * reconst_loss).sum() / avg_reconst_bs
         loss += diffusion_loss[reconst_bs:].sum() / (batch_size - avg_reconst_bs)
         loss += prior_loss
+        loss += repa_loss * 0.0
 
         if args.selfcond:
             nll = (reconst_loss * selfcond_mask[:reconst_bs]).sum() / (avg_reconst_bs * avg_selfcond_mask)

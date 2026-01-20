@@ -55,6 +55,8 @@ def wrap_main(main_fn):
             if world_size == 1:
                 _worker_fn(0, world_size, main_fn, args)
             else:
+                import ipdb ; ipdb.set_trace()
+                raise Exception("not supported")
                 mp.spawn(
                     _worker_fn,
                     (world_size, main_fn, args),

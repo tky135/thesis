@@ -73,7 +73,7 @@ class TransformerBlock(nn.Module):
                 0, (batch_size + 1) * seq_len, step=seq_len,
                 dtype=torch.int32, device=qkv.device
             )
-        x = flash_attn.flash_attn_interface.flash_attn_unpadded_qkvpacked_func(
+        x = flash_attn.flash_attn_interface.flash_attn_varlen_qkvpacked_func(
             qkv, cu_seqlens, seq_len, 0., causal=self.causal)
         x = rearrange(x, '(b s) h d -> b s (h d)', b=batch_size)
         x = residual_linear(
@@ -146,6 +146,18 @@ class DiffusionModel(nn.Module):
             TransformerBlock(dim, n_heads, False, residual_scale)
             for i in range(n_blocks)
         ])
+        
+        
+        self.adapt_mlp = nn.Sequential(
+            nn.Linear(384, 384),
+            nn.SiLU(),
+            nn.Linear(384, 384),
+            nn.SiLU(),
+            nn.Linear(384, 1024),
+        )
+        # self.adapt_conv_1d = nn.Sequential(
+            
+        # )
 
         self.output_norm = lib.models.LayerNorm(dim)
         self.output_linear = mup.MuReadout(dim, vocab_size)
@@ -157,8 +169,10 @@ class DiffusionModel(nn.Module):
         self.vocab_size = vocab_size
 
     def forward(self, z, gamma, embedding_matrix, bias_scale, x_selfcond,
-        selfcond_mask=None, cu_seqlens=None):
-
+        selfcond_mask=None, cu_seqlens=None, get_latents=False, repa=False, y_student=None):
+        if repa:
+            y_student = self.adapt_mlp(y_student.float())
+            return y_student
         if selfcond_mask is None:
             selfcond_mask = torch.ones(z.shape[0], device='cuda')
 
@@ -183,9 +197,14 @@ class DiffusionModel(nn.Module):
         x = x + gamma_embed
 
         rotary_cos_sin = self.rotary_emb(x)
+        
+        if get_latents is True:
+            ret_latents = []
         with torch.cuda.amp.autocast(dtype=torch.bfloat16):
             for i in range(len(self.blocks)):
                 x = self.blocks[i](x, rotary_cos_sin, cu_seqlens=cu_seqlens)
+                if get_latents is True:
+                    ret_latents.append(x)
 
         x = self.output_norm(x.float())
 
@@ -218,6 +237,8 @@ class DiffusionModel(nn.Module):
             selfcond_mask.float()[:,None,None]
         )
 
+        if get_latents:
+            return logits, x_reconst, ret_latents
         return logits, x_reconst
 
 class AutoregressiveModel(nn.Module):
