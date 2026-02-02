@@ -118,6 +118,7 @@ def main(**args):
     args.setdefault('clip_quantile', 0.95)
     args.setdefault('reconst_bs_ema', 0.997)
     args.setdefault('final_val_steps', 3000)
+    args.setdefault('repa_proj', 'mlp')
 
     lib.utils.print_args(args)
 
@@ -141,14 +142,14 @@ def main(**args):
     vocab_size = len(word2idx)
     print(f'vocab_size: {vocab_size}')
 
-    def create_modules(dim, n_heads):
+    def create_modules(dim, n_heads, repa_proj='mlp'):
         return {
             'noise_schedule': lib.models.NoiseSchedule().float(),
             'gamma_bounds': lib.models.GammaBounds(args.gamma_0, args.gamma_1).float(),
             'embedding_matrix': lib.models.EmbeddingMatrix(vocab_size, args.embed_dim).float(),
-            'model': lib.models.DiffusionModel(dim, args.embed_dim, args.n_blocks, n_heads, vocab_size).float()
+            'model': lib.models.DiffusionModel(dim, args.embed_dim, args.n_blocks, n_heads, vocab_size, repa_proj=repa_proj).float()
         }
-    modules = create_modules(args.dim, args.n_heads)
+    modules = create_modules(args.dim, args.n_heads, repa_proj=args.repa_proj)
     base_modules = create_modules(256, 4)
     delta_modules = create_modules(128, 2)
     for key in modules:
@@ -400,7 +401,14 @@ def main(**args):
             y_student = ddp_modules['model'](None, None, None, None, None, repa=True, y_student=latents[1]
                                             )
             y_teacher = y_teacher.detach().float()
-            
+
+            # iREPA spatial normalization on teacher (conv1d path only)
+            if args.repa_proj == 'conv1d':
+                
+                t_mean = y_teacher.mean(dim=1, keepdim=True)
+                t_std  = y_teacher.std(dim=1, keepdim=True)
+                y_teacher = (y_teacher - t_mean) / (t_std + 1e-6)
+
             y_student = F.normalize(y_student, dim=-1)
             y_teacher  = F.normalize(y_teacher,  dim=-1)
             cos = (y_teacher * y_student).sum(dim=-1)

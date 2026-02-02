@@ -130,7 +130,7 @@ class GammaBounds(nn.Module):
         return self.gamma_0.clone().double(), self.gamma_1.clone().double()
 
 class DiffusionModel(nn.Module):
-    def __init__(self, dim, embed_dim, n_blocks, n_heads, vocab_size):
+    def __init__(self, dim, embed_dim, n_blocks, n_heads, vocab_size, repa_proj='mlp'):
         super().__init__()
 
         self.input_linear = nn.Linear(embed_dim, dim, bias=False)
@@ -146,18 +146,26 @@ class DiffusionModel(nn.Module):
             TransformerBlock(dim, n_heads, False, residual_scale)
             for i in range(n_blocks)
         ])
-        
-        
-        self.adapt_mlp = nn.Sequential(
-            nn.Linear(384, 384),
-            nn.SiLU(),
-            nn.Linear(384, 384),
-            nn.SiLU(),
-            nn.Linear(384, 1024),
-        )
-        # self.adapt_conv_1d = nn.Sequential(
-            
-        # )
+
+        self.repa_proj = repa_proj
+        if repa_proj == 'mlp':
+            self.adapt_mlp = nn.Sequential(
+                nn.Linear(384, 384),
+                nn.SiLU(),
+                nn.Linear(384, 384),
+                nn.SiLU(),
+                nn.Linear(384, 1024),
+            )
+        elif repa_proj == 'conv1d':
+            self.adapt_conv1d = nn.Sequential(
+                nn.Conv1d(384, 384, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Conv1d(384, 384, kernel_size=3, padding=1),
+                nn.SiLU(),
+                nn.Conv1d(384, 1024, kernel_size=3, padding=1),
+            )
+        else:
+            raise ValueError(f'Unknown repa_proj: {repa_proj}')
 
         self.output_norm = lib.models.LayerNorm(dim)
         self.output_linear = mup.MuReadout(dim, vocab_size)
@@ -171,8 +179,12 @@ class DiffusionModel(nn.Module):
     def forward(self, z, gamma, embedding_matrix, bias_scale, x_selfcond,
         selfcond_mask=None, cu_seqlens=None, get_latents=False, repa=False, y_student=None):
         if repa:
-            y_student = self.adapt_mlp(y_student.float())
-            return y_student
+            y = y_student.float()
+            if self.repa_proj == 'conv1d':
+                y = self.adapt_conv1d(y.transpose(1, 2)).transpose(1, 2)
+            else:
+                y = self.adapt_mlp(y)
+            return y
         if selfcond_mask is None:
             selfcond_mask = torch.ones(z.shape[0], device='cuda')
 
