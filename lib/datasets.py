@@ -14,7 +14,7 @@ import torch.nn.utils.rnn
 from tokenizers import Tokenizer
 
 # Generate using misc/owt2_preprocess.py
-OPENWEBTEXT2_DATA_DIR = '/data02/kt19/owt2'
+OPENWEBTEXT2_DATA_DIR = '/u/kt19/data/owt'
 # https://mattmahoney.net/dc/enwik8.zip
 ENWIK8_PATH           = '/REPLACE_ME/data/enwik8'
 # https://mattmahoney.net/dc/text8.zip

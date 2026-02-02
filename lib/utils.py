@@ -70,7 +70,8 @@ def train_loop(
     grad_accum_steps=1,
     ddp_models=[],
     clip_params=[],
-    clip_quantile=0.95
+    clip_quantile=0.95,
+    writer=None
     ):
 
     def lr_fn(step):
@@ -151,6 +152,12 @@ def train_loop(
                 means['grad_norm'],
                 torch.cuda.max_memory_allocated() / (1024**3)
             )
+            # TensorBoard logging
+            if writer is not None:
+                for name, val in means.items():
+                    writer.add_scalar(f'train/{name}', val, step)
+                writer.add_scalar('train/learning_rate', scheduler.get_last_lr()[0], step)
+                writer.add_scalar('train/memory_gb', torch.cuda.max_memory_allocated() / (1024**3), step)
             histories.clear()
 
         if hook is not None:

@@ -12,13 +12,107 @@ import torch.nn.functional as F
 import tqdm
 from torch import nn, optim, autograd
 
+
+# ============================================================================
+# Perplexity Evaluation Function
+# ============================================================================
+
+def compute_perplexity(
+    texts,
+    model=None,
+    tokenizer=None,
+    model_name="gpt2",
+    device="cuda",
+    max_length=1024,
+    stride=512,
+):
+    """
+    Compute perplexity of generated texts using a standard language model.
+    
+    Args:
+        texts: List of strings to evaluate.
+        model: Pre-loaded model (optional, will load if None).
+        tokenizer: Pre-loaded tokenizer (optional, will load if None).
+        model_name: HuggingFace model name if model/tokenizer not provided.
+        device: Device to use.
+        max_length: Maximum sequence length for the evaluation model.
+        stride: Stride for sliding window on long sequences.
+    
+    Returns:
+        dict with per-text perplexities, mean perplexity, and losses.
+    """
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    
+    # Load model and tokenizer if not provided
+    if model is None or tokenizer is None:
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+        model.to(device)
+        model.eval()
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    all_losses = []
+    
+    with torch.no_grad():
+        for text in texts:
+            # Tokenize
+            encodings = tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=False,
+                add_special_tokens=True,
+            )
+            
+            seq_len = encodings.input_ids.size(1)
+            
+            if seq_len <= max_length:
+                input_ids = encodings.input_ids.to(device)
+                target_ids = input_ids.clone()
+                outputs = model(input_ids, labels=target_ids)
+                neg_log_likelihood = outputs.loss.item()
+            else:
+                # Sliding window for long sequences
+                nlls = []
+                prev_end_loc = 0
+                
+                for begin_loc in range(0, seq_len, stride):
+                    end_loc = min(begin_loc + max_length, seq_len)
+                    trg_len = end_loc - prev_end_loc
+                    
+                    input_ids = encodings.input_ids[:, begin_loc:end_loc].to(device)
+                    target_ids = input_ids.clone()
+                    target_ids[:, :-trg_len] = -100
+                    
+                    outputs = model(input_ids, labels=target_ids)
+                    nlls.append(outputs.loss.item() * trg_len)
+                    
+                    prev_end_loc = end_loc
+                    if end_loc == seq_len:
+                        break
+                
+                neg_log_likelihood = sum(nlls) / prev_end_loc
+            
+            all_losses.append(neg_log_likelihood)
+    
+    perplexities = [np.exp(loss) for loss in all_losses]
+    mean_perplexity = np.exp(np.mean(all_losses))
+    
+    return {
+        "perplexity": perplexities,
+        "mean_perplexity": mean_perplexity,
+        "loss": all_losses,
+    }
+
+
 def main(**args):
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
     args = lib.utils.AttributeDict(args)
     args.setdefault('seq_len', 256)
-    args.setdefault('vocab_size', 32768)
+    args.setdefault('vocab_size', 128001)
     args.setdefault('weights_path', None)
     args.setdefault('dim', 384)
     args.setdefault('n_blocks', 3)
@@ -27,13 +121,16 @@ def main(**args):
     args.setdefault('gamma_1', 6.)
     args.setdefault('embed_dim', 16)
     args.setdefault('initial_noise_scale', 1.0)
-    args.setdefault('n_samples', 8)
+    args.setdefault('n_samples', 32)
     args.setdefault('sampling_timesteps', 4096)
     args.setdefault('score_temp', 0.9)
     args.setdefault('output_scale', 1.)
     args.setdefault('owt2_tokenizer', True)
     args.setdefault('ddim_sampler', False)
     args.setdefault('guidance_weight', 2.)
+    # New args for perplexity evaluation
+    args.setdefault('ppl_model', 'gpt2')
+    args.setdefault('eval_perplexity', True)
 
     lib.utils.print_args(args)
 
@@ -46,6 +143,22 @@ def main(**args):
     # appropriate.
     torch.set_default_dtype(torch.float64)
 
+    # ========================================================================
+    # Load perplexity evaluation model once (to avoid repeated loading)
+    # ========================================================================
+    ppl_model = None
+    ppl_tokenizer = None
+    if args.eval_perplexity:
+        print(f"\nLoading perplexity evaluation model: {args.ppl_model}")
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        ppl_tokenizer = AutoTokenizer.from_pretrained(args.ppl_model)
+        ppl_model = AutoModelForCausalLM.from_pretrained(args.ppl_model)
+        ppl_model.to('cuda')
+        ppl_model.eval()
+        if ppl_tokenizer.pad_token is None:
+            ppl_tokenizer.pad_token = ppl_tokenizer.eos_token
+        print(f"Perplexity model loaded successfully.\n")
+        
     def log1mexp(x):
         # Computes log(1-exp(-|x|))
         x = -x.abs()
@@ -62,6 +175,28 @@ def main(**args):
             'embedding_matrix': lib.models.EmbeddingMatrix(args.vocab_size, args.embed_dim).float(),
             'model': lib.models.DiffusionModel(dim, args.embed_dim, args.n_blocks, n_heads, args.vocab_size).float()
         }
+        
+    def evaluate_and_print_ppl(texts, task_name):
+        """Helper function to evaluate and print perplexity results."""
+        if not args.eval_perplexity:
+            return
+        print(f"\n{'='*60}")
+        print(f"Perplexity Evaluation ({args.ppl_model}) - {task_name}")
+        print(f"{'='*60}")
+        results = compute_perplexity(
+            texts, 
+            model=ppl_model, 
+            tokenizer=ppl_tokenizer,
+            device='cuda'
+        )
+        for i, (text, ppl) in enumerate(zip(texts, results["perplexity"])):
+            # Truncate text for display
+            display_text = text[:80] + "..." if len(text) > 80 else text
+            display_text = display_text.replace("\n", "↵")
+            print(f"  Sample {i+1}: PPL = {ppl:.2f}")
+        print(f"  Mean Perplexity: {results['mean_perplexity']:.2f}")
+        print(f"{'='*60}\n")
+        return results
     modules = create_modules(args.dim, args.n_heads)
     base_modules = create_modules(256, 4)
     delta_modules = create_modules(128, 2)
@@ -186,10 +321,13 @@ def main(**args):
 
     def print_samples(x_samples):
         if args.owt2_tokenizer:
-            owt2_tokenizer = lib.datasets.openwebtext2_tokenizer()
+            ret_list = []
+            owt2_tokenizer = lib.datasets.deberta_tokenizer()
             for x in x_samples:
                 x = owt2_tokenizer.decode(x.tolist(), skip_special_tokens=False)
                 print(x.replace("\n", "↵"))
+                ret_list.append(x.replace("\n", "↵"))
+            return ret_list
         else:
             for x in x_samples:
                 x = x.tolist()
@@ -206,85 +344,108 @@ def main(**args):
                 # replace newlines with '↵' symbol for cleaner printing
                 print(x.replace("\n", "↵"))
 
-    tokenizer = lib.datasets.openwebtext2_tokenizer()
+    tokenizer = lib.datasets.deberta_tokenizer()
 
+    # ========================================================================
+    # 1. Unconditional Generation
+    # ========================================================================
     print('Unconditional:')
-    print_samples(generate_samples([], seq_len=1024))
+    x_samples = generate_samples([], seq_len=256)
+    texts = print_samples(x_samples)
+    evaluate_and_print_ppl(texts, "Unconditional Generation")
     print("\n"*10)
 
+    # ========================================================================
+    # 2. Prefix Completion
+    # ========================================================================
     prefixes = [
         ' This easy chicken curry recipe is made with just a handful of ingredients',
         ' Generative models of text are very versatile: they can be used'
     ]
     for prefix in prefixes:
         print('Prefix completion: ', prefix)
-        prefix = tokenizer.encode(prefix).ids
-        print_samples(generate_samples(
-            [(token, args.guidance_weight, position, False) for position, token in enumerate(prefix)]
-        ))
+        prefix_tokens = tokenizer.encode(prefix)
+        x_samples = generate_samples(
+            [(token, args.guidance_weight, position, False) for position, token in enumerate(prefix_tokens)], seq_len=256
+        )
+        texts = print_samples(x_samples)
+        evaluate_and_print_ppl(texts, f"Prefix Completion: '{prefix[:50]}...'")
         print("\n"*10)
 
+    # ========================================================================
+    # 3. Infilling
+    # ========================================================================
     print('Infilling: A year ago in Paris, [...] Wow, what a great day!')
-    tokenizer = lib.datasets.openwebtext2_tokenizer()
-    prefix = tokenizer.encode(' A year ago in Paris,').ids
-    suffix = tokenizer.encode('. Wow, what a great day!').ids
+    tokenizer = lib.datasets.deberta_tokenizer()
+    prefix = tokenizer.encode(' A year ago in Paris,')
+    suffix = tokenizer.encode('. Wow, what a great day!')
     infill_len = 40
-    print_samples(generate_samples(
+    x_samples = generate_samples(
         [(token, args.guidance_weight, position, False) for position, token in enumerate(prefix)]
-        + [(token, args.guidance_weight, position + len(prefix) + infill_len, False) for position, token in enumerate(suffix)]
-    ))
+        + [(token, args.guidance_weight, position + len(prefix) + infill_len, False) for position, token in enumerate(suffix)], seq_len=256
+    )
+    texts = print_samples(x_samples)
+    evaluate_and_print_ppl(texts, "Infilling")
     print("\n"*10)
 
-    print('Word-level weights: Let\'s talk about law[10] and medicine[1].')
-    guidance = [
-        (tokenizer.encode(' Let').ids,      args.guidance_weight,   0,  False),
-        (tokenizer.encode('\'s').ids,       args.guidance_weight,   1,  False),
-        (tokenizer.encode(' talk').ids,     args.guidance_weight,   2,  False),
-        (tokenizer.encode(' about').ids,    args.guidance_weight,   3,  False),
-        (tokenizer.encode(' law').ids,      10.,                    4,  False),
-        (tokenizer.encode(' and').ids,      args.guidance_weight,   5,  False),
-        (tokenizer.encode(' medicine').ids, args.guidance_weight,   6,  False),
-        (tokenizer.encode('.').ids,         args.guidance_weight,   7,  False),
-    ]
-    assert(all(len(a) == 1 for a,_,_,_ in guidance))
-    guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
-    print_samples(generate_samples(guidance))
-    print('\n'*10)
+    # # ========================================================================
+    # # 5. Word-level weights: law[1] and medicine[10]
+    # # ========================================================================
+    # print('Word-level weights: Let\'s talk about law[1] and medicine[10].')
+    # guidance = [
+    #     (tokenizer.encode(' Let'),      args.guidance_weight,   0,  False),
+    #     (tokenizer.encode('\'s'),       args.guidance_weight,   1,  False),
+    #     (tokenizer.encode(' talk'),     args.guidance_weight,   2,  False),
+    #     (tokenizer.encode(' about'),    args.guidance_weight,   3,  False),
+    #     (tokenizer.encode(' law'),      args.guidance_weight,   4,  False),
+    #     (tokenizer.encode(' and'),      args.guidance_weight,   5,  False),
+    #     (tokenizer.encode(' medicine'), 10.,                    6,  False),
+    #     (tokenizer.encode('.'),         args.guidance_weight,   7,  False),
+    # ]
+    # assert(all(len(a) == 1 for a,_,_,_ in guidance))
+    # guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
+    # x_samples = generate_samples(guidance, seq_len=256)
+    # texts = print_samples(x_samples)
+    # evaluate_and_print_ppl(texts, "Word-level weights: law[1], medicine[10]")
+    # print('\n'*10)
 
-    print('Word-level weights: Let\'s talk about law[1] and medicine[10].')
-    guidance = [
-        (tokenizer.encode(' Let').ids,      args.guidance_weight,   0,  False),
-        (tokenizer.encode('\'s').ids,       args.guidance_weight,   1,  False),
-        (tokenizer.encode(' talk').ids,     args.guidance_weight,   2,  False),
-        (tokenizer.encode(' about').ids,    args.guidance_weight,   3,  False),
-        (tokenizer.encode(' law').ids,      args.guidance_weight,   4,  False),
-        (tokenizer.encode(' and').ids,      args.guidance_weight,   5,  False),
-        (tokenizer.encode(' medicine').ids, 10.,                    6,  False),
-        (tokenizer.encode('.').ids,         args.guidance_weight,   7,  False),
-    ]
-    assert(all(len(a) == 1 for a,_,_,_ in guidance))
-    guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
-    print_samples(generate_samples(guidance))
-    print('\n'*10)
+    # # ========================================================================
+    # # 6. Lexically constrained generation: Donald
+    # # ========================================================================
+    # print(f'Lexically constrained generation: Donald')
+    # guidance = [
+    #     (tokenizer.encode(' Donald'), 3., 'any', False),
+    # ]
+    # assert(all(len(a) == 1 for a,_,_,_ in guidance))
+    # guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
+    # x_samples = generate_samples(guidance, seq_len=256)
+    # texts = print_samples(x_samples)
+    # evaluate_and_print_ppl(texts, "Lexically Constrained: 'Donald'")
+    # print("\n"*10)
 
-    print(f'Lexically constrained generation: Donald')
-    guidance = [
-        (tokenizer.encode(' Donald').ids, 3., 'any', False),
-    ]
-    assert(all(len(a) == 1 for a,_,_,_ in guidance))
-    guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
-    print_samples(generate_samples(guidance))
-    print("\n"*10)
+    # # ========================================================================
+    # # 7. Negation: Donald but not Trump
+    # # ========================================================================
+    # print(f'Negation: Donald but not Trump')
+    # guidance = [
+    #     (tokenizer.encode(' Donald'), 3., 'any', False),
+    #     (tokenizer.encode(' Trump'), 10., 'all', True),
+    # ]
+    # assert(all(len(a) == 1 for a,_,_,_ in guidance))
+    # guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
+    # x_samples = generate_samples(guidance, seq_len=256)
+    # texts = print_samples(x_samples)
+    # evaluate_and_print_ppl(texts, "Negation: 'Donald' but not 'Trump'")
+    # print("\n"*10)
 
-    print(f'Negation: Donald but not Trump')
-    guidance = [
-        (tokenizer.encode(' Donald').ids, 3., 'any', False),
-        (tokenizer.encode(' Trump').ids, 10., 'all', True),
-    ]
-    assert(all(len(a) == 1 for a,_,_,_ in guidance))
-    guidance = [(a[0], b, c, d) for a,b,c,d in guidance]
-    print_samples(generate_samples(guidance))
-    print("\n"*10)
+    # ========================================================================
+    # Print summary of all perplexity results
+    # ========================================================================
+    if args.eval_perplexity:
+        print("\n" + "="*70)
+        print("PERPLEXITY EVALUATION COMPLETE")
+        print(f"Evaluation model: {args.ppl_model}")
+        print("="*70)
 
 
 if __name__ == '__main__':

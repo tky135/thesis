@@ -20,9 +20,15 @@ import torch.nn.functional as F
 import tqdm
 from torch import nn, optim, autograd
 from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.tensorboard import SummaryWriter
 from ipdb import iex
 
 from transformers import AutoTokenizer, AutoModel
+import warnings
+# Suppress autocast deprecation warnings
+warnings.filterwarnings("ignore", message=".*torch.cuda.amp.autocast.*")
+# Suppress nvfuser warnings
+warnings.filterwarnings("ignore", message=".*nvfuser.*")
 
 class DebertaTeacher(nn.Module):
     def __init__(self, name="microsoft/deberta-v3-large", device="cuda",
@@ -114,6 +120,9 @@ def main(**args):
     args.setdefault('final_val_steps', 3000)
 
     lib.utils.print_args(args)
+
+    # Initialize TensorBoard writer (only on rank 0)
+    writer = SummaryWriter(log_dir='runs') if lib.ddp.rank() == 0 else None
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -388,7 +397,6 @@ def main(**args):
         
         if train_mode:
             # Add representation alignment loss
-            
             y_student = ddp_modules['model'](None, None, None, None, None, repa=True, y_student=latents[1]
                                             )
             y_teacher = y_teacher.detach().float()
@@ -513,6 +521,16 @@ def main(**args):
                 print(f'NLL (val, seq_len=256): {val_nll_256}')
 
             if lib.ddp.rank() == 0:
+                # TensorBoard: Log validation metrics
+                if writer is not None:
+                    writer.add_scalar('val/nll', val_nll, step)
+                    if args.seq_len != 256:
+                        writer.add_scalar('val/nll_256', val_nll_256, step)
+                    # Log EMA tracking variables
+                    writer.add_scalar('ema/reconst', reconst_ema.item(), step)
+                    writer.add_scalar('ema/diffusion', diffusion_ema.item(), step)
+                    writer.add_scalar('ema/repa', repa_ema.item(), step)
+
                 # Save weights
                 if args.save_weights:
                     for name in modules:
@@ -527,7 +545,13 @@ def main(**args):
                 gamma = modules['noise_schedule'](t)
                 plt.clf()
                 plt.plot(t.detach().cpu().numpy(), gamma.detach().cpu().numpy())
+                plt.xlabel('t')
+                plt.ylabel('gamma')
+                plt.title(f'Noise Schedule (step {step})')
                 plt.savefig(f'gamma_{step}.jpg')
+                # TensorBoard: Log gamma plot as figure
+                if writer is not None:
+                    writer.add_figure('noise_schedule/gamma', plt.gcf(), step)
 
     print('Starting train loop...')
     lib.utils.train_loop(
@@ -549,6 +573,7 @@ def main(**args):
             for param in module.parameters()
         ],
         clip_quantile=args.clip_quantile,
+        writer=writer,
     )
 
     final_val_nll = compute_nll(val_iterator, args.final_val_steps)
@@ -556,6 +581,11 @@ def main(**args):
     if args.seq_len != 256:
         final_val_nll_256 = compute_nll(val_iterator, args.final_val_steps, seq_len=256)
         print('Final val NLL (seq_len=256):', final_val_nll_256)
+
+    # Close TensorBoard writer
+    if writer is not None:
+        writer.add_scalar('val/final_nll', final_val_nll, args.steps)
+        writer.close()
 
     return all_val_nlls, final_val_nll
 
