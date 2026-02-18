@@ -5,3 +5,5 @@ __pycache__
 *.jpg
 *.pt
 /plaid-1b/
+/*.out
+/02*

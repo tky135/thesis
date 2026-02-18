@@ -71,7 +71,7 @@ class DebertaTeacher(nn.Module):
         # else:
         #     raise ValueError("use_layer must be 'last' or 'second_last'")
 
-        h = out.hidden_states[9]
+        h = out.hidden_states[15]
         if self.pool is True:
             attn = enc["attention_mask"].unsqueeze(-1)     # [B, Lt, 1]
             pooled = (h * attn).sum(dim=1) / attn.sum(dim=1).clamp_min(1.0)  # [B, H]
@@ -103,18 +103,18 @@ def main(**args):
     args.setdefault('n_heads', 6)
     args.setdefault('gamma_0', -3.)
     args.setdefault('gamma_1', 6.)
-    args.setdefault('embed_dim', 384)
+    args.setdefault('embed_dim', 128)
     args.setdefault('seq_len', 256)
     args.setdefault('val_steps', 100)
     args.setdefault('val_batch_size', 64)
     args.setdefault('weight_decay', 4e-5)
     args.setdefault('first_step', 0)
-    args.setdefault('auto_resume', True)
+    args.setdefault('auto_resume', False)
     args.setdefault('decay_to_init', 0.)
     args.setdefault('ema', 0.)
     args.setdefault('beta1', 0.9)
     args.setdefault('beta2', 0.99)
-    args.setdefault('selfcond', True)
+    args.setdefault('selfcond', False)
     args.setdefault('n_short_seqs', 2)
     args.setdefault('clip_quantile', 0.95)
     args.setdefault('reconst_bs_ema', 0.997)
@@ -225,22 +225,24 @@ def main(**args):
             
             y_teacher = teacher(x.cuda())
             batch_size = x.shape[0] * accum_total
-            if step not in reconst_bs_cache:
-                # Synchronize EMA vars
-                reconst_ema       = lib.ddp.reduce_mean(reconst_ema)
-                repa_ema          = lib.ddp.reduce_mean(repa_ema)
-                reconst_sqr_ema   = lib.ddp.reduce_mean(reconst_sqr_ema)
-                diffusion_ema     = lib.ddp.reduce_mean(diffusion_ema)
-                diffusion_sqr_ema = lib.ddp.reduce_mean(diffusion_sqr_ema)
-                # Compute reconst_bs
-                b = 1 / loss_ema_bias # Bias correction factor
-                reconst_std   = (b*reconst_sqr_ema   - (b*reconst_ema)**2).clamp(min=0).sqrt()
-                diffusion_std = (b*diffusion_sqr_ema - (b*diffusion_ema)**2).clamp(min=0).sqrt()
-                reconst_bs = batch_size * (reconst_std / (1e-8 + reconst_std + diffusion_std))
-                reconst_bs = int(reconst_bs.round().clamp(1, batch_size-1))
-                reconst_bs_cache[step] = reconst_bs
-            reconst_bs = reconst_bs_cache[step]
-            avg_reconst_bs = float(reconst_bs)
+            reconst_bs = (batch_size // 8)
+            reconst_bs += int(np.random.binomial(1, (batch_size % 8) / 8.))
+            # if step not in reconst_bs_cache:
+            #     # Synchronize EMA vars
+            #     reconst_ema       = lib.ddp.reduce_mean(reconst_ema)
+            #     repa_ema          = lib.ddp.reduce_mean(repa_ema)
+            #     reconst_sqr_ema   = lib.ddp.reduce_mean(reconst_sqr_ema)
+            #     diffusion_ema     = lib.ddp.reduce_mean(diffusion_ema)
+            #     diffusion_sqr_ema = lib.ddp.reduce_mean(diffusion_sqr_ema)
+            #     # Compute reconst_bs
+            #     b = 1 / loss_ema_bias # Bias correction factor
+            #     reconst_std   = (b*reconst_sqr_ema   - (b*reconst_ema)**2).clamp(min=0).sqrt()
+            #     diffusion_std = (b*diffusion_sqr_ema - (b*diffusion_ema)**2).clamp(min=0).sqrt()
+            #     reconst_bs = batch_size * (reconst_std / (1e-8 + reconst_std + diffusion_std))
+            #     reconst_bs = int(reconst_bs.round().clamp(1, batch_size-1))
+            #     reconst_bs_cache[step] = reconst_bs
+            # reconst_bs = reconst_bs_cache[step]
+            # avg_reconst_bs = float(reconst_bs)
         else:
             x = x_eval
             batch_size = x.shape[0]
@@ -288,7 +290,7 @@ def main(**args):
             # Don't propagate grads for the first reconst_bs entries of t
             gamma = torch.cat([
                 ddp_modules['noise_schedule'](t[:reconst_bs]).detach(),
-                ddp_modules['noise_schedule'](t[reconst_bs:])
+                ddp_modules['noise_schedule'](t[reconst_bs:]).detach()
             ])
             gamma_prime = autograd.grad(gamma.sum(), [t], create_graph=True)[0]
         # Edits gradients so that the noise schedule minimizes
@@ -307,6 +309,9 @@ def main(**args):
         set_grad_hook(gamma)
         set_grad_hook(gamma_prime)
         gamma_0, gamma_1 = ddp_modules['gamma_bounds']()
+        
+        
+        gamma_0, gamma_1 = gamma_0.detach(), gamma_1.detach()
         gamma = gamma_0 + (gamma_1 - gamma_0) * gamma
         gamma_prime = (gamma_1 - gamma_0) * gamma_prime
 
@@ -399,7 +404,7 @@ def main(**args):
         
         if train_mode:
             # Add representation alignment loss
-            y_student = ddp_modules['model'](None, None, None, None, None, repa=True, y_student=latents[8]
+            y_student = ddp_modules['model'](None, None, None, None, None, repa=True, y_student=latents[5]
                                             )
             y_teacher = y_teacher.detach().float()
 

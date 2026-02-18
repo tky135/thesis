@@ -54,55 +54,66 @@ def compute_perplexity(
         tokenizer.pad_token = tokenizer.eos_token
     
     all_losses = []
-    
+    token_counts = []
+
     with torch.no_grad():
         for text in texts:
-            # Tokenize
-            encodings = tokenizer(
-                text,
-                return_tensors="pt",
-                truncation=False,
-                add_special_tokens=True,
-            )
-            
+            encodings = tokenizer(text, return_tensors="pt", truncation=False, add_special_tokens=True)
             seq_len = encodings.input_ids.size(1)
-            
+
             if seq_len <= max_length:
                 input_ids = encodings.input_ids.to(device)
                 target_ids = input_ids.clone()
                 outputs = model(input_ids, labels=target_ids)
+
+                # HF CausalLM loss is over shifted labels => ~ (seq_len - 1) tokens
+                n_tokens = max(seq_len - 1, 0)
                 neg_log_likelihood = outputs.loss.item()
             else:
-                # Sliding window for long sequences
-                nlls = []
+                nll_sum = 0.0
+                n_tokens = 0
                 prev_end_loc = 0
-                
+
                 for begin_loc in range(0, seq_len, stride):
                     end_loc = min(begin_loc + max_length, seq_len)
-                    trg_len = end_loc - prev_end_loc
-                    
                     input_ids = encodings.input_ids[:, begin_loc:end_loc].to(device)
                     target_ids = input_ids.clone()
-                    target_ids[:, :-trg_len] = -100
-                    
+
+                    trg_len = end_loc - prev_end_loc
+                    target_ids[:, :-trg_len] = -100  # score only new tokens in this window
+
                     outputs = model(input_ids, labels=target_ids)
-                    nlls.append(outputs.loss.item() * trg_len)
-                    
+
+                    # Count *actually scored* tokens robustly (accounts for the internal shift)
+                    scored = (target_ids[:, 1:] != -100).sum().item()
+
+                    nll_sum += outputs.loss.item() * scored
+                    n_tokens += scored
+
                     prev_end_loc = end_loc
                     if end_loc == seq_len:
                         break
-                
-                neg_log_likelihood = sum(nlls) / prev_end_loc
-            
+
+                neg_log_likelihood = nll_sum / max(n_tokens, 1)
+
             all_losses.append(neg_log_likelihood)
-    
+            token_counts.append(n_tokens)
+
     perplexities = [np.exp(loss) for loss in all_losses]
-    mean_perplexity = np.exp(np.mean(all_losses))
-    
+
+    # sample-weighted (what you currently do)
+    mean_perplexity_sample = np.exp(np.mean(all_losses))
+
+    # token-weighted corpus-level
+    corpus_loss = np.sum(np.array(all_losses) * np.array(token_counts)) / np.sum(token_counts)
+    mean_perplexity_token = np.exp(corpus_loss)
+
     return {
         "perplexity": perplexities,
-        "mean_perplexity": mean_perplexity,
+        "mean_perplexity_sample": mean_perplexity_sample,
+        "mean_perplexity_token": mean_perplexity_token,
         "loss": all_losses,
+        "token_counts": token_counts,
     }
 
 
@@ -122,7 +133,8 @@ def main(**args):
     args.setdefault('embed_dim', 16)
     args.setdefault('initial_noise_scale', 1.0)
     args.setdefault('n_samples', 32)
-    args.setdefault('sampling_timesteps', 4096)
+    args.setdefault('n_batches', 20)   # total samples per task (uncond/prefix/infill)
+    args.setdefault('sampling_timesteps', 256)
     args.setdefault('score_temp', 0.9)
     args.setdefault('output_scale', 1.)
     args.setdefault('owt2_tokenizer', True)
@@ -194,7 +206,8 @@ def main(**args):
             display_text = text[:80] + "..." if len(text) > 80 else text
             display_text = display_text.replace("\n", "↵")
             print(f"  Sample {i+1}: PPL = {ppl:.2f}")
-        print(f"  Mean Perplexity: {results['mean_perplexity']:.2f}")
+        print(f"  Mean Perplexity Sample: {results['mean_perplexity_sample']:.2f}")
+        print(f"  Mean Perplexity Token: {results['mean_perplexity_token']:.2f}")
         print(f"{'='*60}\n")
         return results
     modules = create_modules(args.dim, args.n_heads)
@@ -207,15 +220,34 @@ def main(**args):
 
     print(f'Loading weights from {args.weights_path}')
     for name, module in modules.items():
-        module.load_state_dict(torch.load(
-            os.path.join(args.weights_path, f'{name}.pt'),
-            map_location=torch.device('cuda')
-        ))
+        state = torch.load(
+        os.path.join(args.weights_path, f"{name}.pt"),
+        map_location="cuda",
+        )
+
+        incompat = module.load_state_dict(state, strict=False)
+
+        print("Missing keys (in checkpoint -> not found in model):")
+        for k in incompat.missing_keys:
+            print("  ", k)
+
+        print("Unexpected keys (in checkpoint -> not used by model):")
+        for k in incompat.unexpected_keys:
+            print("  ", k)
 
     for key in modules:
         print(key+':')
         lib.utils.print_model(modules[key])
 
+
+    def generate_samples_batched(guidance_tokens, seq_len=args.seq_len):
+        n_batches = args.n_batches
+        text_all = []
+        for b in range(n_batches):
+            x_samples = generate_samples(guidance_tokens, seq_len=seq_len)
+            text_all.extend(x_samples)
+
+        return text_all
 
     def generate_samples(guidance_tokens, seq_len=args.seq_len):
         """
@@ -350,7 +382,7 @@ def main(**args):
     # 1. Unconditional Generation
     # ========================================================================
     print('Unconditional:')
-    x_samples = generate_samples([], seq_len=256)
+    x_samples = generate_samples_batched([], seq_len=256)
     texts = print_samples(x_samples)
     evaluate_and_print_ppl(texts, "Unconditional Generation")
     print("\n"*10)
@@ -364,8 +396,8 @@ def main(**args):
     ]
     for prefix in prefixes:
         print('Prefix completion: ', prefix)
-        prefix_tokens = tokenizer.encode(prefix)
-        x_samples = generate_samples(
+        prefix_tokens = tokenizer.encode(prefix, add_special_tokens=False)
+        x_samples = generate_samples_batched(
             [(token, args.guidance_weight, position, False) for position, token in enumerate(prefix_tokens)], seq_len=256
         )
         texts = print_samples(x_samples)
@@ -377,10 +409,10 @@ def main(**args):
     # ========================================================================
     print('Infilling: A year ago in Paris, [...] Wow, what a great day!')
     tokenizer = lib.datasets.deberta_tokenizer()
-    prefix = tokenizer.encode(' A year ago in Paris,')
-    suffix = tokenizer.encode('. Wow, what a great day!')
+    prefix = tokenizer.encode(' A year ago in Paris,', add_special_tokens=False)
+    suffix = tokenizer.encode('. Wow, what a great day!', add_special_tokens=False)
     infill_len = 40
-    x_samples = generate_samples(
+    x_samples = generate_samples_batched(
         [(token, args.guidance_weight, position, False) for position, token in enumerate(prefix)]
         + [(token, args.guidance_weight, position + len(prefix) + infill_len, False) for position, token in enumerate(suffix)], seq_len=256
     )

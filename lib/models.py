@@ -158,11 +158,11 @@ class DiffusionModel(nn.Module):
             )
         elif repa_proj == 'conv1d':
             self.adapt_conv1d = nn.Sequential(
-                nn.Conv1d(384, 384, kernel_size=3, padding=1),
-                nn.SiLU(),
-                nn.Conv1d(384, 384, kernel_size=3, padding=1),
-                nn.SiLU(),
                 nn.Conv1d(384, 1024, kernel_size=3, padding=1),
+                # nn.SiLU(),
+                # nn.Conv1d(384, 384, kernel_size=3, padding=1),
+                # nn.SiLU(),
+                # nn.Conv1d(384, 1024, kernel_size=3, padding=1),
             )
         else:
             raise ValueError(f'Unknown repa_proj: {repa_proj}')
@@ -242,7 +242,7 @@ class DiffusionModel(nn.Module):
         # Comment for 'no categorical reparameterization' ablation
         x_reconst = F.softmax(logits, dim=2)
         x_reconst = x_reconst @ torch.cat([
-            embedding_matrix, embedding_matrix.detach()], dim=1)
+            embedding_matrix, embedding_matrix.detach()], dim=1) # [B, N, 32]
         x_reconst = torch.lerp(
             x_reconst[:,:,:self.embed_dim],
             x_reconst[:,:,self.embed_dim:],
