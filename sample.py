@@ -123,7 +123,7 @@ def main(**args):
 
     args = lib.utils.AttributeDict(args)
     args.setdefault('seq_len', 256)
-    args.setdefault('vocab_size', 128001)
+    args.setdefault('vocab_size', 32100)
     args.setdefault('weights_path', None)
     args.setdefault('dim', 384)
     args.setdefault('n_blocks', 3)
@@ -354,7 +354,7 @@ def main(**args):
     def print_samples(x_samples):
         if args.owt2_tokenizer:
             ret_list = []
-            owt2_tokenizer = lib.datasets.deberta_tokenizer()
+            owt2_tokenizer = lib.datasets.openwebtext2_tokenizer()
             for x in x_samples:
                 x = owt2_tokenizer.decode(x.tolist(), skip_special_tokens=False)
                 print(x.replace("\n", "↵"))
@@ -376,7 +376,9 @@ def main(**args):
                 # replace newlines with '↵' symbol for cleaner printing
                 print(x.replace("\n", "↵"))
 
-    tokenizer = lib.datasets.deberta_tokenizer()
+    # tokenizer = lib.datasets.openwebtext2_tokenizer()
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-base")
 
     # ========================================================================
     # 1. Unconditional Generation
@@ -408,7 +410,8 @@ def main(**args):
     # 3. Infilling
     # ========================================================================
     print('Infilling: A year ago in Paris, [...] Wow, what a great day!')
-    tokenizer = lib.datasets.deberta_tokenizer()
+    # tokenizer = lib.datasets.openwebtext2_tokenizer()
+    tokenizer = AutoTokenizer.from_pretrained("google-t5/t5-base")
     prefix = tokenizer.encode(' A year ago in Paris,', add_special_tokens=False)
     suffix = tokenizer.encode('. Wow, what a great day!', add_special_tokens=False)
     infill_len = 40

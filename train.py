@@ -29,7 +29,209 @@ import warnings
 warnings.filterwarnings("ignore", message=".*torch.cuda.amp.autocast.*")
 # Suppress nvfuser warnings
 warnings.filterwarnings("ignore", message=".*nvfuser.*")
+import torch
+import torch.nn as nn
+from transformers import AutoTokenizer, AutoModel
 
+import torch
+import torch.nn as nn
+from transformers import AutoTokenizer, T5EncoderModel
+
+
+class T5Teacher(nn.Module):
+    def __init__(
+        self,
+        name="google-t5/t5-base",
+        device="cuda",
+        use_layer="last",   # "last", "second_last", or int
+        max_length=256,
+        dtype=torch.float16,
+        pool=False,
+    ):
+        super().__init__()
+
+        self.tokenizer = AutoTokenizer.from_pretrained(name, use_fast=True)
+        self.model = T5EncoderModel.from_pretrained(name)   # encoder only
+        self.model.eval()
+        self.model.requires_grad_(False)
+
+        self.device = device
+        self.max_length = max_length
+        self.use_layer = use_layer
+        self.dtype = dtype
+        self.pool = pool
+
+        self.model.to(self.device)
+
+    def _get_attention_mask(self, input_ids):
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            return torch.ones_like(input_ids, dtype=torch.long)
+        return (input_ids != pad_token_id).long()
+
+    def _select_hidden(self, out):
+        if isinstance(self.use_layer, int):
+            h = out.hidden_states[self.use_layer]
+        elif self.use_layer == "last":
+            h = out.last_hidden_state
+        elif self.use_layer == "second_last":
+            h = out.hidden_states[-2]
+        else:
+            raise ValueError("use_layer must be 'last', 'second_last', or an int")
+        return h
+
+    @torch.no_grad()
+    def forward(self, input_ids):
+        """
+        input_ids: [B, N]
+            IMPORTANT: these must come from the T5 tokenizer, not GPT-2/DeBERTa tokenizer.
+        """
+        input_ids = input_ids.to(self.device)
+        attention_mask = self._get_attention_mask(input_ids).to(self.device)
+
+        use_autocast = (
+            self.device.startswith("cuda")
+            and self.dtype in (torch.float16, torch.bfloat16)
+        )
+
+        if use_autocast:
+            with torch.autocast(device_type="cuda", dtype=self.dtype):
+                out = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True,
+                )
+        else:
+            out = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+            )
+
+        h = self._select_hidden(out)   # [B, N, D]
+
+        if self.pool:
+            attn = attention_mask.unsqueeze(-1).to(h.dtype)   # [B, N, 1]
+            pooled = (h * attn).sum(dim=1) / attn.sum(dim=1).clamp_min(1.0)
+            return pooled
+        else:
+            return h, out.hidden_states
+
+# teacher = T5Teacher(name="google-t5/t5-base", use_layer="second_last")
+
+# texts = ["hello world", "a second sentence"]
+# enc = teacher.tokenizer(
+#     texts,
+#     padding=True,
+#     truncation=True,
+#     max_length=teacher.max_length,
+#     return_tensors="pt",
+# )
+
+# h, all_h = teacher(enc["input_ids"])
+# print(h.shape)   # [B, N, D]
+
+class GPT2Teacher(nn.Module):
+    def __init__(
+        self,
+        name="openai-community/gpt2",
+        device="cuda",
+        use_layer="second_last",   # "last", "second_last", or int
+        max_length=256,
+        dtype=torch.float16,
+        pool=False,
+    ):
+        super().__init__()
+
+        self.tokenizer = AutoTokenizer.from_pretrained(name, use_fast=True)
+
+        # GPT-2 usually has no pad token by default
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        self.model = AutoModel.from_pretrained(name)   # bare GPT2Model backbone
+        self.model.eval()
+        self.model.requires_grad_(False)
+
+        self.device = device
+        self.max_length = max_length
+        self.use_layer = use_layer
+        self.dtype = dtype
+        self.pool = pool
+
+        self.model.to(self.device)
+
+    def _get_attention_mask(self, input_ids):
+        # If padded, use pad_token_id to build mask; otherwise all ones
+        pad_token_id = self.tokenizer.pad_token_id
+        if pad_token_id is None:
+            return torch.ones_like(input_ids, dtype=torch.long)
+        return (input_ids != pad_token_id).long()
+
+    def _select_hidden(self, out):
+        if isinstance(self.use_layer, int):
+            h = out.hidden_states[self.use_layer]
+        elif self.use_layer == "last":
+            h = out.last_hidden_state
+        elif self.use_layer == "second_last":
+            h = out.hidden_states[-2]
+        else:
+            raise ValueError("use_layer must be 'last', 'second_last', or an int")
+        return h
+
+    @torch.no_grad()
+    def forward(self, input_ids):
+        """
+        input_ids: [B, N]
+            IMPORTANT: these must come from the GPT-2 tokenizer, not DeBERTa/T5 tokenizer.
+        """
+        input_ids = input_ids.to(self.device)
+        attention_mask = self._get_attention_mask(input_ids).to(self.device)
+
+        use_autocast = (self.device.startswith("cuda") and self.dtype in (torch.float16, torch.bfloat16))
+
+        if use_autocast:
+            with torch.autocast(device_type="cuda", dtype=self.dtype):
+                out = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True,
+                    return_dict=True,
+                    use_cache=False,   # full [B, N, D] features
+                )
+        else:
+            out = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+                return_dict=True,
+                use_cache=False,
+            )
+
+        h = self._select_hidden(out)   # [B, N, D]
+
+        if self.pool:
+            attn = attention_mask.unsqueeze(-1).to(h.dtype)   # [B, N, 1]
+            pooled = (h * attn).sum(dim=1) / attn.sum(dim=1).clamp_min(1.0)
+            return pooled
+        else:
+            return h, out.hidden_states
+# teacher = GPT2Teacher(name="openai-community/gpt2", use_layer="second_last")
+
+# texts = ["hello world", "a second sentence"]
+# enc = teacher.tokenizer(
+#     texts,
+#     padding=True,
+#     truncation=True,
+#     max_length=teacher.max_length,
+#     return_tensors="pt",
+# )
+
+# h, all_h = teacher(enc["input_ids"])
+# print(h.shape)
+# import ipdb ; ipdb.set_trace()
 class DebertaTeacher(nn.Module):
     def __init__(self, name="microsoft/deberta-v3-large", device="cuda",
                  use_layer="second_last", max_length=256, dtype=torch.float16, pool=False):
@@ -77,12 +279,205 @@ class DebertaTeacher(nn.Module):
             pooled = (h * attn).sum(dim=1) / attn.sum(dim=1).clamp_min(1.0)  # [B, H]
             return pooled
         else:
-            return h
+            return h, out.hidden_states
         
 # teacher = DebertaTeacher()
 # teacher("this is a bad cat. This is also a bad dog")
 # import ipdb ; ipdb.set_trace()
+@torch.no_grad()
+def visualize_text_latents(
+    latents,
+    token_ids,
+    idx2word=None,
+    save_path="text_latents.png",
+    sample_idx=0,
+    layer_ids=None,
+    max_tokens=48,
+    global_pca=True,
+    timestep=None,
+    figsize_per_layer=0.6,
+    show_xticks_only_last=True,
+    stripe_gap=0.03,
+):
+    """
+    Visualize text latents from different DiT layers as PCA-colored token strips.
 
+    Args:
+        latents: list of tensors, each with shape [B, L, D] or [L, D]
+        token_ids: tensor with shape [B, L] or [L]
+        idx2word: mapping from token id -> string; can be dict or list
+        save_path: output image path
+        sample_idx: which sample in batch to visualize
+        layer_ids: list of layer indices to visualize; default = all layers
+        max_tokens: truncate sequence for readability
+        global_pca: if True, fit one PCA across all chosen layers for this sample
+        timestep: optional scalar for figure title
+        figsize_per_layer: controls vertical figure size
+        show_xticks_only_last: if True, only show x tick labels on the last stripe
+        stripe_gap: vertical gap between stripes
+    """
+
+    if not isinstance(latents, (list, tuple)) or len(latents) == 0:
+        raise ValueError("latents must be a non-empty list/tuple of layer tensors.")
+
+    if layer_ids is None:
+        layer_ids = list(range(len(latents)))
+
+    # ----------------------------
+    # Select one sample + truncate
+    # ----------------------------
+    if token_ids.ndim == 2:
+        token_ids_sample = token_ids[sample_idx]
+    elif token_ids.ndim == 1:
+        token_ids_sample = token_ids
+    else:
+        raise ValueError(f"token_ids must be [B, L] or [L], got shape {tuple(token_ids.shape)}")
+
+    token_ids_sample = token_ids_sample.detach().cpu()
+    seq_len = min(len(token_ids_sample), max_tokens)
+    token_ids_sample = token_ids_sample[:seq_len]
+
+    # Decode tokens
+    def decode_one(tid):
+        tid = int(tid)
+        if idx2word is None:
+            tok = str(tid)
+        elif isinstance(idx2word, dict):
+            tok = idx2word.get(tid, str(tid))
+        else:
+            tok = idx2word[tid] if 0 <= tid < len(idx2word) else str(tid)
+
+        if isinstance(tok, bytes):
+            tok = tok.decode("utf-8", errors="replace")
+
+        tok = str(tok)
+        tok = tok.replace("\n", "\\n").replace("\t", "\\t")
+        return tok
+
+    tokens = [decode_one(tid) for tid in token_ids_sample.tolist()]
+
+    # ----------------------------
+    # Gather chosen layer features
+    # ----------------------------
+    layer_feats = []
+    for lid in layer_ids:
+        h = latents[lid]
+        if not torch.is_tensor(h):
+            raise ValueError(f"latents[{lid}] is not a tensor.")
+
+        if h.ndim == 3:
+            x = h[sample_idx, :seq_len]   # [L, D]
+        elif h.ndim == 2:
+            x = h[:seq_len]               # [L, D]
+        else:
+            raise ValueError(
+                f"latents[{lid}] must have shape [B, L, D] or [L, D], got {tuple(h.shape)}"
+            )
+
+        x = x.detach().float().cpu()
+        layer_feats.append(x)
+
+    # ----------------------------
+    # PCA projection helper
+    # ----------------------------
+    def project_to_rgb(X, mean, basis):
+        """
+        X: [L, D]
+        mean: [1, D]
+        basis: [D, 3]
+        returns rgb in [0,1], shape [L, 3]
+        """
+        Y = (X - mean) @ basis  # [L, 3]
+
+        y_min = Y.min(dim=0, keepdim=True).values
+        y_max = Y.max(dim=0, keepdim=True).values
+        Y = (Y - y_min) / (y_max - y_min + 1e-8)
+
+        return Y.clamp(0, 1).numpy()
+
+    # Fit one PCA across all selected layers if requested
+    if global_pca:
+        X_all = torch.cat(layer_feats, dim=0)  # [n_layers * L, D]
+        mean_global = X_all.mean(dim=0, keepdim=True)
+        X_all_centered = X_all - mean_global
+        q = min(3, X_all_centered.shape[0], X_all_centered.shape[1])
+        _, _, V = torch.pca_lowrank(X_all_centered, q=q, center=False)
+        basis_global = V[:, :q]
+        if q < 3:
+            pad = torch.zeros(basis_global.shape[0], 3 - q)
+            basis_global = torch.cat([basis_global, pad], dim=1)
+    else:
+        mean_global, basis_global = None, None
+
+    # ----------------------------
+    # Make figure
+    # ----------------------------
+    n_layers = len(layer_ids)
+    fig_h = max(1.6, n_layers * figsize_per_layer)
+    fig_w = max(10, min(0.45 * seq_len, 24))
+
+    fig, axes = plt.subplots(
+        nrows=n_layers,
+        ncols=1,
+        figsize=(fig_w, fig_h),
+        squeeze=False,
+        sharex=True
+    )
+
+    axes = axes[:, 0]
+
+    for row, (lid, X) in enumerate(zip(layer_ids, layer_feats)):
+        ax = axes[row]
+
+        if global_pca:
+            rgb = project_to_rgb(X, mean_global, basis_global)
+        else:
+            mean_local = X.mean(dim=0, keepdim=True)
+            X_centered = X - mean_local
+            q = min(3, X_centered.shape[0], X_centered.shape[1])
+            _, _, V = torch.pca_lowrank(X_centered, q=q, center=False)
+            basis = V[:, :q]
+            if q < 3:
+                pad = torch.zeros(basis.shape[0], 3 - q)
+                basis = torch.cat([basis, pad], dim=1)
+            rgb = project_to_rgb(X, mean_local, basis)
+
+        # Draw a single-row RGB image: [1, L, 3]
+        ax.imshow(rgb[None, :, :], aspect="auto", interpolation="nearest")
+
+        # y label only
+        ax.set_yticks([0])
+        ax.set_yticklabels([f"L{lid}"], fontsize=9)
+
+        # x ticks: only last stripe
+        ax.set_xticks(np.arange(seq_len))
+        if show_xticks_only_last and row != n_layers - 1:
+            ax.tick_params(axis='x', which='both', bottom=False, labelbottom=False)
+        else:
+            ax.set_xticklabels(tokens, rotation=90, fontsize=8)
+            ax.tick_params(axis='x', length=0, pad=1)
+
+        # Clean borders
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        ax.tick_params(axis='y', length=0, pad=2)
+
+    title = "Text latent visualization (PCA-colored token strips)"
+    if timestep is not None:
+        if torch.is_tensor(timestep):
+            timestep = float(timestep)
+        title += f" | t={timestep:.4f}"
+    fig.suptitle(title, fontsize=12)
+
+    # Make stripes close together
+    fig.subplots_adjust(hspace=stripe_gap)
+
+    # Leave room at bottom for the last stripe token labels
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    plt.savefig(save_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    
 def main(**args):
     args = lib.utils.AttributeDict(args)
     args.setdefault('batch_size', 64)
@@ -95,7 +490,7 @@ def main(**args):
     args.setdefault('lr_decay', True)
     args.setdefault('print_freq', 100)
     args.setdefault('save_weights', True)
-    args.setdefault('steps', 92000)
+    args.setdefault('steps', 94000)
     args.setdefault('weights_path', None)
     args.setdefault('reconst_weight', 1.0)
     args.setdefault('dim', 384)
@@ -103,13 +498,13 @@ def main(**args):
     args.setdefault('n_heads', 6)
     args.setdefault('gamma_0', -3.)
     args.setdefault('gamma_1', 6.)
-    args.setdefault('embed_dim', 384)
+    args.setdefault('embed_dim', 16)
     args.setdefault('seq_len', 256)
     args.setdefault('val_steps', 100)
     args.setdefault('val_batch_size', 64)
     args.setdefault('weight_decay', 4e-5)
     args.setdefault('first_step', 0)
-    args.setdefault('auto_resume', True)
+    args.setdefault('auto_resume', False)
     args.setdefault('decay_to_init', 0.)
     args.setdefault('ema', 0.)
     args.setdefault('beta1', 0.9)
@@ -210,6 +605,9 @@ def main(**args):
     reconst_bs_cache  = {}
     
     teacher = DebertaTeacher()
+    # teacher = GPT2Teacher(name="openai-community/gpt2", use_layer="second_last")
+    # teacher = T5Teacher(name="google-t5/t5-base", use_layer="last")
+    idx2word_real = {k:teacher.tokenizer.decode(k) for (k, v) in idx2word.items()}
     
     @iex
     def forward(step=None, accum_step=None, accum_total=None, x_eval=None):
@@ -223,24 +621,29 @@ def main(**args):
             x = next(train_iterator)
             
             
-            y_teacher = teacher(x.cuda())
-            batch_size = x.shape[0] * accum_total
-            if step not in reconst_bs_cache:
-                # Synchronize EMA vars
-                reconst_ema       = lib.ddp.reduce_mean(reconst_ema)
-                repa_ema          = lib.ddp.reduce_mean(repa_ema)
-                reconst_sqr_ema   = lib.ddp.reduce_mean(reconst_sqr_ema)
-                diffusion_ema     = lib.ddp.reduce_mean(diffusion_ema)
-                diffusion_sqr_ema = lib.ddp.reduce_mean(diffusion_sqr_ema)
-                # Compute reconst_bs
-                b = 1 / loss_ema_bias # Bias correction factor
-                reconst_std   = (b*reconst_sqr_ema   - (b*reconst_ema)**2).clamp(min=0).sqrt()
-                diffusion_std = (b*diffusion_sqr_ema - (b*diffusion_ema)**2).clamp(min=0).sqrt()
-                reconst_bs = batch_size * (reconst_std / (1e-8 + reconst_std + diffusion_std))
-                reconst_bs = int(reconst_bs.round().clamp(1, batch_size-1))
-                reconst_bs_cache[step] = reconst_bs
-            reconst_bs = reconst_bs_cache[step]
-            avg_reconst_bs = float(reconst_bs)
+            orig_x = x.clone()
+            y_teacher, all_teacher_layers = teacher(x.cuda())
+            batch_size = x.shape[0]
+            reconst_bs = (batch_size // 8)
+            reconst_bs += int(np.random.binomial(1, (batch_size % 8) / 8.))
+            avg_reconst_bs = batch_size / 8.
+            # batch_size = x.shape[0] * accum_total
+            # if step not in reconst_bs_cache:
+            #     # Synchronize EMA vars
+            #     reconst_ema       = lib.ddp.reduce_mean(reconst_ema)
+            #     repa_ema          = lib.ddp.reduce_mean(repa_ema)
+            #     reconst_sqr_ema   = lib.ddp.reduce_mean(reconst_sqr_ema)
+            #     diffusion_ema     = lib.ddp.reduce_mean(diffusion_ema)
+            #     diffusion_sqr_ema = lib.ddp.reduce_mean(diffusion_sqr_ema)
+            #     # Compute reconst_bs
+            #     b = 1 / loss_ema_bias # Bias correction factor
+            #     reconst_std   = (b*reconst_sqr_ema   - (b*reconst_ema)**2).clamp(min=0).sqrt()
+            #     diffusion_std = (b*diffusion_sqr_ema - (b*diffusion_ema)**2).clamp(min=0).sqrt()
+            #     reconst_bs = batch_size * (reconst_std / (1e-8 + reconst_std + diffusion_std))
+            #     reconst_bs = int(reconst_bs.round().clamp(1, batch_size-1))
+            #     reconst_bs_cache[step] = reconst_bs
+            # reconst_bs = reconst_bs_cache[step]
+            # avg_reconst_bs = float(reconst_bs)
         else:
             x = x_eval
             batch_size = x.shape[0]
@@ -377,6 +780,46 @@ def main(**args):
                 cu_seqlens=cu_seqlens,
                 get_latents=True
             )
+            
+            
+            if train_mode and step is not None and step % 1000 == 0 and lib.ddp.rank() == 0:
+                visualize_text_latents(
+                    latents=latents,
+                    token_ids=orig_x,
+                    idx2word=idx2word_real,
+                    save_path=f"text_latents_step_{step}.png",
+                    sample_idx=0,
+                    layer_ids=list(range(len(latents))),
+                    max_tokens=256,
+                    global_pca=True,
+                    timestep=t[0].detach().cpu()
+                )
+                
+                ### for gpt2
+                # visualize_text_latents(
+                #     latents=[l[:, 1:] for l in all_teacher_layers],
+                #     token_ids=orig_x,
+                #     idx2word=idx2word_real,
+                #     save_path=f"text_latents_teacher_step_{step}.png",
+                #     sample_idx=0,
+                #     layer_ids=list(range(1, 12)),
+                #     max_tokens=256,
+                #     global_pca=True,
+                #     timestep=t[0].detach().cpu()
+                # )
+                
+                ### for t5
+                visualize_text_latents(
+                    latents=all_teacher_layers,
+                    token_ids=orig_x,
+                    idx2word=idx2word_real,
+                    save_path=f"text_latents_teacher_step_{step}.png",
+                    sample_idx=0,
+                    layer_ids=list(range(len(all_teacher_layers))),
+                    max_tokens=256,
+                    global_pca=False,
+                    timestep=t[0].detach().cpu()
+                )
 
         # Loss terms
         reconst_loss = lib.ops.cross_entropy(
@@ -397,7 +840,8 @@ def main(**args):
         diffusion_loss = diffusion_loss.mean(dim=1).double().sum(dim=1)
         diffusion_loss = -0.5*(snr_prime * diffusion_loss)
         
-        if train_mode:
+        enable_repa_loss = True
+        if train_mode and enable_repa_loss:
             # Add representation alignment loss
             y_student = ddp_modules['model'](None, None, None, None, None, repa=True, y_student=latents[8]
                                             )
