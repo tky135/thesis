@@ -490,7 +490,7 @@ def main(**args):
     args.setdefault('lr_decay', True)
     args.setdefault('print_freq', 100)
     args.setdefault('save_weights', True)
-    args.setdefault('steps', 94000)
+    args.setdefault('steps', 200000)
     args.setdefault('weights_path', None)
     args.setdefault('reconst_weight', 1.0)
     args.setdefault('dim', 384)
@@ -624,9 +624,9 @@ def main(**args):
             orig_x = x.clone()
             y_teacher, all_teacher_layers = teacher(x.cuda())
             batch_size = x.shape[0]
-            reconst_bs = (batch_size // 8)
+            reconst_bs = 32 # (batch_size // 8)
             reconst_bs += int(np.random.binomial(1, (batch_size % 8) / 8.))
-            avg_reconst_bs = batch_size / 8.
+            avg_reconst_bs = 32 # batch_size / 8.
             # batch_size = x.shape[0] * accum_total
             # if step not in reconst_bs_cache:
             #     # Synchronize EMA vars
