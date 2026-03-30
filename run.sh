@@ -4,6 +4,7 @@ conda activate plaid
 mkdir $1
 cd $1
 cp ../train.py .
+cp ../sample.py .
 cp -r ../lib .
 cp -r ../misc .
 ln -s ../iREPA

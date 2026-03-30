@@ -22,6 +22,7 @@ from torch import nn, optim, autograd
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 from ipdb import iex
+from sample import compute_perplexity
 
 from transformers import AutoTokenizer, AutoModel
 import warnings
@@ -484,6 +485,7 @@ def main(**args):
     args.setdefault('dataset', 'openwebtext2')
     args.setdefault('grad_accum_steps', 1)
     args.setdefault('hook_freq', 100)
+    args.setdefault('save_freq_mult', 50)
     args.setdefault('lr', 1.4e-3)
     args.setdefault('lr_warmup_steps', 2500)
     args.setdefault('bias_warmup_steps', 5000)
@@ -515,6 +517,12 @@ def main(**args):
     args.setdefault('reconst_bs_ema', 0.997)
     args.setdefault('final_val_steps', 3000)
     args.setdefault('repa_proj', 'conv1d')
+    args.setdefault('ppl_eval_freq', 1000)
+    args.setdefault('ppl_eval_model', 'gpt2-large')
+    args.setdefault('ppl_n_samples', 1024)
+    args.setdefault('ppl_sample_batch_size', 64)
+    args.setdefault('ppl_sampling_timesteps', 256)
+    args.setdefault('ppl_score_temp', 0.9)
 
     lib.utils.print_args(args)
 
@@ -567,9 +575,13 @@ def main(**args):
         assert(args.save_weights)
 
     first_step = args.first_step
-    if args.auto_resume and os.path.exists('model.pt'):
-            load_weights('.')
-            with open('step', 'r') as f:
+    if args.auto_resume:
+        import glob as glob_mod
+        ckpt_dirs = sorted(glob_mod.glob('checkpoint_*'), key=lambda d: int(d.split('_')[-1]))
+        if ckpt_dirs:
+            latest_ckpt = ckpt_dirs[-1]
+            load_weights(latest_ckpt)
+            with open(os.path.join(latest_ckpt, 'step'), 'r') as f:
                 first_step = int(f.read()) + 1
     elif args.weights_path is not None:
         load_weights(args.weights_path)
@@ -608,7 +620,23 @@ def main(**args):
     # teacher = GPT2Teacher(name="openai-community/gpt2", use_layer="second_last")
     # teacher = T5Teacher(name="google-t5/t5-base", use_layer="last")
     idx2word_real = {k:teacher.tokenizer.decode(k) for (k, v) in idx2word.items()}
-    
+
+    ppl_eval_model = None
+    ppl_eval_tokenizer = None
+    if args.ppl_eval_freq > 0 and lib.ddp.rank() == 0:
+        prev_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(torch.float32)
+        from transformers import AutoModelForCausalLM
+        print(f'Loading perplexity evaluation model: {args.ppl_eval_model}')
+        ppl_eval_tokenizer = AutoTokenizer.from_pretrained(args.ppl_eval_model)
+        ppl_eval_model = AutoModelForCausalLM.from_pretrained(args.ppl_eval_model)
+        ppl_eval_model.to('cuda')
+        ppl_eval_model.eval()
+        if ppl_eval_tokenizer.pad_token is None:
+            ppl_eval_tokenizer.pad_token = ppl_eval_tokenizer.eos_token
+        print('Perplexity evaluation model loaded.')
+        torch.set_default_dtype(prev_dtype)
+
     @iex
     def forward(step=None, accum_step=None, accum_total=None, x_eval=None):
         """
@@ -956,6 +984,93 @@ def main(**args):
                     break
         return lib.ddp.reduce_mean(total_nll / total_tokens).item()
 
+    def generate_samples_for_eval(n_samples, seq_len=args.seq_len):
+        """Generate unconditional samples using EMA weights for ppl evaluation."""
+        with contextlib.ExitStack() as stack:
+            for ema in emas.values():
+                stack.enter_context(ema.enabled())
+            stack.enter_context(torch.no_grad())
+
+            embedding_matrix = modules['embedding_matrix']()
+            gamma_0, gamma_1 = modules['gamma_bounds']()
+
+            z = torch.randn((n_samples, seq_len, args.embed_dim), device='cuda')
+            x_selfcond = torch.zeros_like(z).float()
+
+            sampling_timesteps = args.ppl_sampling_timesteps
+            for t in torch.linspace(1., 0., sampling_timesteps):
+                t = t[None].cuda()
+                s = t - 1. / sampling_timesteps
+                gamma_s = modules['noise_schedule'](s).double()
+                gamma_t = modules['noise_schedule'](t).double()
+                gamma_s = gamma_0 + (gamma_1 - gamma_0) * gamma_s
+                gamma_t = gamma_0 + (gamma_1 - gamma_0) * gamma_t
+                alpha_squared_s = torch.sigmoid(-gamma_s)
+                alpha_squared_t = torch.sigmoid(-gamma_t)
+                alpha_t = alpha_squared_t.sqrt()
+                sigma_squared_s = torch.sigmoid(gamma_s)
+                sigma_squared_t = torch.sigmoid(gamma_t)
+                sigma_t = sigma_squared_t.sqrt()
+
+                _, x_reconst = modules['model'](
+                    z=z.to(torch.float32, copy=True),
+                    gamma=gamma_t.float(),
+                    embedding_matrix=embedding_matrix,
+                    bias_scale=1.,
+                    x_selfcond=x_selfcond
+                )
+                x_selfcond = x_reconst.clone().detach()
+                x_reconst = x_reconst.double()
+                epsilon_pred = (z - (alpha_t * x_reconst)) / sigma_t
+                epsilon_pred /= args.ppl_score_temp
+                x_reconst = (z - (sigma_t * epsilon_pred)) / alpha_t
+                if t > 0:
+                    c = -torch.expm1(gamma_s - gamma_t)
+                    z *= (1 - c) * alpha_squared_s.sqrt() / alpha_squared_t.sqrt()
+                    z += c * (alpha_squared_s.sqrt() * x_reconst.double())
+                    z += (c * (1 - alpha_squared_s)).sqrt() * torch.randn_like(z)
+
+            logits, _ = modules['model'](
+                z=z.float(),
+                gamma=gamma_t.float(),
+                embedding_matrix=embedding_matrix,
+                bias_scale=1.,
+                x_selfcond=x_selfcond
+            )
+            return logits.argmax(dim=-1)
+
+    def evaluate_gen_ppl(step):
+        """Generate samples and compute generative perplexity. Rank 0 only."""
+        if lib.ddp.rank() != 0:
+            return
+        print(f'[Step {step}] Generating {args.ppl_n_samples} samples for gen_ppl...')
+        all_samples = []
+        for batch_start in range(0, args.ppl_n_samples, args.ppl_sample_batch_size):
+            batch_n = min(args.ppl_sample_batch_size, args.ppl_n_samples - batch_start)
+            samples = generate_samples_for_eval(batch_n)
+            all_samples.append(samples.cpu())
+        x_samples = torch.cat(all_samples, dim=0)
+
+        texts = teacher.tokenizer.batch_decode(x_samples.tolist(), skip_special_tokens=False)
+        for i, text in enumerate(texts[:3]):
+            display = text[:200].replace("\n", "\\n")
+            print(f'  Sample {i}: {display}')
+
+        results = compute_perplexity(
+            texts,
+            model=ppl_eval_model,
+            tokenizer=ppl_eval_tokenizer,
+            device='cuda'
+        )
+        gen_ppl = results['mean_perplexity_sample']
+        gen_ppl_token = results['mean_perplexity_token']
+        print(f'[Step {step}] val/gen_ppl (sample-weighted): {gen_ppl:.2f}')
+        print(f'[Step {step}] val/gen_ppl (token-weighted): {gen_ppl_token:.2f}')
+        if writer is not None:
+            writer.add_scalar('val/gen_ppl', gen_ppl, step)
+            writer.add_scalar('val/gen_ppl_token', gen_ppl_token, step)
+        torch.cuda.empty_cache()
+
     all_val_nlls = []
     def hook(step):
         for decay in decay_to_init.values():
@@ -976,6 +1091,8 @@ def main(**args):
                 # TensorBoard: Log validation metrics
                 if writer is not None:
                     writer.add_scalar('val/nll', val_nll, step)
+                    val_ppl = float(np.exp(val_nll))
+                    writer.add_scalar('val/ppl', val_ppl, step)
                     if args.seq_len != 256:
                         writer.add_scalar('val/nll_256', val_nll_256, step)
                     # Log EMA tracking variables
@@ -984,13 +1101,16 @@ def main(**args):
                     writer.add_scalar('ema/repa', repa_ema.item(), step)
 
                 # Save weights
-                if args.save_weights:
+                save_freq = args.hook_freq * args.save_freq_mult
+                if args.save_weights and step % save_freq == (save_freq - 1):
+                    ckpt_dir = f'checkpoint_{step}'
+                    os.makedirs(ckpt_dir, exist_ok=True)
                     for name in modules:
                         with emas[name].enabled():
-                            torch.save(modules[name].state_dict(), f'{name}.pt')
-                    with open('step', 'w') as f:
+                            torch.save(modules[name].state_dict(), os.path.join(ckpt_dir, f'{name}.pt'))
+                    with open(os.path.join(ckpt_dir, 'step'), 'w') as f:
                         f.write(str(step))
-                    print('Saved weights!')
+                    print(f'Saved weights to {ckpt_dir}/')
 
                 # Save gamma plot
                 t = torch.linspace(0., 1., 1024).cuda()
@@ -1004,6 +1124,11 @@ def main(**args):
                 # TensorBoard: Log gamma plot as figure
                 if writer is not None:
                     writer.add_figure('noise_schedule/gamma', plt.gcf(), step)
+
+        if args.ppl_eval_freq > 0 and step % args.ppl_eval_freq == (args.ppl_eval_freq - 1):
+            evaluate_gen_ppl(step)
+            if lib.ddp.world_size() > 1:
+                torch.distributed.barrier()
 
     print('Starting train loop...')
     lib.utils.train_loop(
